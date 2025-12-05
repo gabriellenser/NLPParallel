@@ -9,6 +9,9 @@ import nltk
 from scipy.sparse import csr_matrix
 import numpy as np
 import psutil
+from monitorr import Monitor
+from pathlib import Path
+
 
 try:
     nltk.data.find('corpora/wordnet')
@@ -275,6 +278,14 @@ class processing:
             f.write(f"   Consumida:    {memoria_consumida_mb:.1f} MB\n")
 
 def processar_arquivo(caminho_arquivo, porcentagem=20, coluna='text'):
+    
+    # CRIA O MONITOR
+    nome_dataset = Path(caminho_arquivo).stem
+    arquivo_monitor = f'monitoring_logs/serial_{nome_dataset}_{porcentagem}p.txt'
+    Path('monitoring_logs').mkdir(exist_ok=True)
+    
+    monitor = Monitor(nome_arquivo=arquivo_monitor, intervalo=60)
+    monitor.iniciar()
 
     inicio_execucao_total = time.perf_counter()
     
@@ -286,23 +297,30 @@ def processar_arquivo(caminho_arquivo, porcentagem=20, coluna='text'):
         coluna=coluna
     )
     
+    monitor.etapa("01_Carregamento")
     textos = processador.carregar_dados(caminho_arquivo)
     processador.atualizar_pico()
     
+    monitor.etapa("02_Tokenizacao_Lematizacao")
     documentos_processados = processador.processar_documentos(textos)
     processador.atualizar_pico()
     
+    monitor.etapa("03_Construcao_Vocabulario")
     vocab, num_docs = processador.construir_vocabulario(documentos_processados)
     processador.atualizar_pico()
     
+    monitor.etapa("04_Vetorizacao_TFIDF")
     total_processados, matriz_tfidf = processador.calcular_tfidf(documentos_processados)
 
     fim_execucao_total = time.perf_counter()
     processador.tempo_execucao_total = fim_execucao_total - inicio_execucao_total
     
+    monitor.etapa("05_Finalizacao")
     processador.calcular_hashes(documentos_processados, matriz_tfidf)
     processador.estatisticas()
     processador.guardar_estatisticas()
+    
+    monitor.parar()
     
     return processador, matriz_tfidf
 

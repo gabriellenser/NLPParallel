@@ -4,8 +4,6 @@ import math
 import time
 import signal
 import sys
-import threading
-import os
 import hashlib
 from collections import defaultdict, Counter
 from nltk.stem import WordNetLemmatizer
@@ -13,7 +11,7 @@ import nltk
 from scipy.sparse import csr_matrix
 import numpy as np
 import psutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 from monitorr import Monitor
 from pathlib import Path
 
@@ -22,14 +20,12 @@ try:
 except LookupError:
     nltk.download('wordnet', quiet=True)
 
-try:
-    _temp_lemmatizer = WordNetLemmatizer()
-    _temp_lemmatizer.lemmatize("test")  
-    del _temp_lemmatizer
-except:
-    pass
 
-def tokenizar(texto):
+def inicializar_worker():
+    global lemmatizer_local
+    lemmatizer_local = WordNetLemmatizer()
+
+def tokenizar_texto(texto):
     if not texto:
         return []
     texto_lower = texto.lower()
@@ -38,14 +34,12 @@ def tokenizar(texto):
 def processar_lote(lote_textos):
     import time
     
-    lemmatizer_local = WordNetLemmatizer()
-    
     inicio_tokenizacao = time.perf_counter()
     todos_tokens = []
     total_tokens_lote = 0
     
     for texto in lote_textos:
-        tokens = tokenizar(texto)
+        tokens = tokenizar_texto(texto)
         todos_tokens.append(tokens)
         total_tokens_lote += len(tokens)
     
@@ -113,21 +107,19 @@ def calcular_tfidf_lote(args):
 
 class processing:
     
-    def __init__(self, min_df=10, max_df=0.9, max_features=50000, porcentagem=100, num_threads=None, coluna='text'):
+    def __init__(self, min_df=10, max_df=0.9, max_features=50000, porcentagem=100, num_processes=None, coluna='text'):
         self.lemmatizer = WordNetLemmatizer()
-        
         
         self.min_df = min_df
         self.max_df = max_df
         self.max_features = max_features
         self.porcentagem = porcentagem
-        self.num_threads = num_threads or (os.cpu_count() or 4)  
+        self.num_processes = num_processes or mp.cpu_count()
         self.coluna = coluna
-        
         
         self.vocabulario = {}
         self.idf = {}
-    
+        
         self.tempo_construcao_vocab = 0.0
         self.tempo_tokenizacao = 0.0
         self.tempo_lematizacao = 0.0
@@ -144,7 +136,7 @@ class processing:
         self.memoria_pico = 0
         self.memoria_final = 0
         
-        self.executor = None
+        self.pool = None
         
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -155,34 +147,41 @@ class processing:
             self.memoria_pico = memoria_atual
     
     def _signal_handler(self, signum, frame):
-        print(f"\nSinal recebido ({signum})")
-        self._cleanup_executor()
-        print("Cleanup concluído")
+        print(f"\nEncerrando processos")
+        self._cleanup_pool()
+        print("Saindo")
         sys.exit(0)
     
-    def _cleanup_executor(self):
-        if self.executor:
+    def _cleanup_pool(self):
+        if self.pool:
             try:
-                self.executor.shutdown(wait=True)
-                print("ThreadPoolExecutor finalizado")
+                self.pool.close()  
+                self.pool.join(timeout=3)  
+                print("Pool finalizada")
             except Exception as e:
-                print(f"Erro no fechamento do executor: {e}")
+                print(f"Forçanco encerramento {e}")
+                try:
+                    self.pool.terminate()  
+                    self.pool.join(timeout=2)  
+                    print("Pool terminado")
+                except Exception as e2:
+                    print(f"Erro no termino: {e2}")
             finally:
-                self.executor = None
+                self.pool = None
     
     def __enter__(self):
         try:
-            self.executor = ThreadPoolExecutor(max_workers=self.num_threads)
+            self.pool = mp.Pool(self.num_processes, initializer=inicializar_worker)
             return self
         except Exception as e:
-            print(f"Erro ao criar ThreadPoolExecutor: {e}")
+            print(f"Erro ao criar pool: {e}")
             raise
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._cleanup_executor()
+        self._cleanup_pool()
         
         if exc_type == KeyboardInterrupt:
-            print("\n Dados Parciais")
+            print("\nEstatísticas parciais.")
             if self.num_documentos > 0:
                 self.estatisticas()
                 self.salvar_dados()
@@ -223,16 +222,11 @@ class processing:
     
     def processar_documentos(self, textos):
         
-        tamanho_lote = len(textos) // self.num_threads
+        tamanho_lote = len(textos) // self.num_processes
         lotes = list(self.dividir_em_lotes(textos, max(tamanho_lote, 1)))
         
         try:
-            futures = [self.executor.submit(processar_lote, lote) for lote in lotes]
-            
-            resultados_completos = []
-            for future in as_completed(futures):
-                resultados_completos.append(future.result())
-                
+            resultados_completos = self.pool.map(processar_lote, lotes)
         except KeyboardInterrupt:
             raise
         
@@ -261,25 +255,25 @@ class processing:
     
     def construir_vocabulario(self, documentos_processados):
         inicio = time.perf_counter()
-        docs_por_thread = len(documentos_processados) // self.num_threads
+        
+        docs_por_processo = len(documentos_processados) // self.num_processes
         lotes_docs = []
         
-        for i in range(self.num_threads):
-            inicio_lote = i * docs_por_thread
-            if i == self.num_threads - 1:
+        for i in range(self.num_processes):
+            inicio_lote = i * docs_por_processo
+            if i == self.num_processes - 1:
                 fim_lote = len(documentos_processados)
             else:
-                fim_lote = (i + 1) * docs_por_thread
+                fim_lote = (i + 1) * docs_por_processo
             
             lote = documentos_processados[inicio_lote:fim_lote]
             lotes_docs.append(lote)
         
         try:
-            futures = [self.executor.submit(construir_vocab_lote, lote) for lote in lotes_docs]
-            resultados = [future.result() for future in as_completed(futures)]
+            resultados = self.pool.map(construir_vocab_lote, lotes_docs)
         except KeyboardInterrupt:
             raise
-    
+        
         inicio_consolidacao_vocab = time.perf_counter()
         
         doc_freq = defaultdict(int)
@@ -325,22 +319,21 @@ class processing:
     def calcular_tfidf(self, documentos_processados):
         inicio = time.perf_counter()
         
-        docs_por_thread = len(documentos_processados) // self.num_threads
+        docs_por_processo = len(documentos_processados) // self.num_processes
         lotes_args = []
         
-        for i in range(self.num_threads):
-            inicio_lote = i * docs_por_thread
-            if i == self.num_threads - 1:
+        for i in range(self.num_processes):
+            inicio_lote = i * docs_por_processo
+            if i == self.num_processes - 1:
                 fim_lote = len(documentos_processados)
             else:
-                fim_lote = (i + 1) * docs_por_thread
+                fim_lote = (i + 1) * docs_por_processo
             
             lote_docs = documentos_processados[inicio_lote:fim_lote]
             lotes_args.append((lote_docs, self.vocabulario, self.idf, inicio_lote))
         
         try:
-            futures = [self.executor.submit(calcular_tfidf_lote, args) for args in lotes_args]
-            resultados_tfidf = [future.result() for future in as_completed(futures)]
+            resultados_tfidf = self.pool.map(calcular_tfidf_lote, lotes_args)
         except KeyboardInterrupt:
             raise
         
@@ -371,9 +364,8 @@ class processing:
         self.tempo_consolidacao = fim_consolidacao - inicio_consolidacao
         
         self.memoria_final = self.processo.memory_info().rss
-        memoria_atual = self.processo.memory_info().rss
-        if memoria_atual > self.memoria_pico:
-            self.memoria_pico = memoria_atual
+        if self.memoria_final > self.memoria_pico:
+            self.memoria_pico = self.memoria_final
         
         return len(documentos_processados), matriz_tfidf
     
@@ -416,7 +408,7 @@ class processing:
     
     def salvar_dados(self, arquivo=None):
         if arquivo is None:
-            arquivo = f'estatisticas_threads_{self.coluna}.txt'
+            arquivo = f'estatisticas_paralelo_{self.coluna}.txt'
             
         with open(arquivo, 'w', encoding='utf-8') as f:
             f.write(f"Documentos processados: {self.num_documentos:,}\n")
@@ -445,12 +437,13 @@ class processing:
             f.write(f"   Final:        {memoria_final_mb:.1f} MB\n")
             f.write(f"   Consumida:    {memoria_consumida_mb:.1f} MB\n")
 
-def processar_arquivo(caminho_arquivo, porcentagem=20, num_threads=None, coluna='text'):
+
+def processar_arquivo(caminho_arquivo, porcentagem=20, num_processes=None, coluna='text'):
     
     # CRIA O MONITOR
     nome_dataset = Path(caminho_arquivo).stem
-    num_t = num_threads or (os.cpu_count() or 4)
-    arquivo_monitor = f'monitoring_logs/thread_{nome_dataset}_{porcentagem}p_{num_t}t.txt'
+    num_proc = num_processes or mp.cpu_count()
+    arquivo_monitor = f'monitoring_logs/mp_{nome_dataset}_{porcentagem}p_{num_proc}w.txt'
     Path('monitoring_logs').mkdir(exist_ok=True)
     
     monitor = Monitor(nome_arquivo=arquivo_monitor, intervalo=60)
@@ -463,7 +456,7 @@ def processar_arquivo(caminho_arquivo, porcentagem=20, num_threads=None, coluna=
         max_df=0.9,
         max_features=50000,
         porcentagem=porcentagem,
-        num_threads=num_threads,
+        num_processes=num_processes,
         coluna=coluna
     ) as processador:
         
@@ -493,12 +486,44 @@ def processar_arquivo(caminho_arquivo, porcentagem=20, num_threads=None, coluna=
         monitor.parar()
         
         return processador, matriz_tfidf
+    
+    inicio_execucao_total = time.perf_counter()
+    
+    with processing(
+        min_df=10,
+        max_df=0.9,
+        max_features=50000,
+        porcentagem=porcentagem,
+        num_processes=num_processes,
+        coluna=coluna
+    ) as processador:
+        
+        textos = processador.carregar_dados(caminho_arquivo)
+        processador.atualizar_pico()
+        
+        documentos_processados = processador.processar_documentos(textos)
+        processador.atualizar_pico()
+        
+        vocab, num_docs = processador.construir_vocabulario(documentos_processados)
+        processador.atualizar_pico()
+        
+        total_processados, matriz_tfidf = processador.calcular_tfidf(documentos_processados)
+        
+        fim_execucao_total = time.perf_counter()
+        processador.tempo_execucao_total = fim_execucao_total - inicio_execucao_total
+        
+        processador.calcular_hashes(documentos_processados, matriz_tfidf)
+        processador.estatisticas()
+        processador.salvar_dados()
+        
+        return processador, matriz_tfidf
+
 if __name__ == "__main__":
     import sys
     
     arquivo = sys.argv[1] if len(sys.argv) > 1 else "amazon.csv"
     porcentagem = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-    num_threads = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    num_processes = int(sys.argv[3]) if len(sys.argv) > 3 else None
     coluna = sys.argv[4] if len(sys.argv) > 4 else 'text'
     
-    processador, matriz = processar_arquivo(arquivo, porcentagem, num_threads, coluna)
+    processador, matriz = processar_arquivo(arquivo, porcentagem, num_processes, coluna)
